@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+match_data/*/structured.json
+match_data/*/prediction.json
+match_data/match_scores.json
+match_data/season_data.json
+match_data/reviews/
+data/
+.env

@@ -1,0 +1,99 @@
+name: 赛后复盘
+
+on:
+  schedule:
+    # 北京时间 06:00 = UTC 22:00 (前一天)
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+    inputs:
+      match_ids:
+        description: '比赛ID列表(空格分隔)，留空则自动复盘今日所有比赛'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests beautifulsoup4 openpyxl
+
+      - name: 更新赛季数据并提取赛果
+        run: |
+          cd scraper
+          python -c "
+          from chuqi_lib import fetch_season_data
+          import json
+          from pathlib import Path
+          season = fetch_season_data()
+          scores = {}
+          for e in season.get('events',[]):
+              mid = str(e.get('id',''))
+              ha, aa = e.get('home_all'), e.get('away_all')
+              if ha is not None and aa is not None:
+                  try: scores[mid] = {'h': int(ha), 'a': int(aa)}
+                  except: pass
+          p = Path('../match_data/match_scores.json')
+          p.parent.mkdir(parents=True, exist_ok=True)
+          if p.exists():
+              old = json.loads(p.read_text(encoding='utf-8'))
+              old.update(scores)
+              scores = old
+          p.write_text(json.dumps(scores, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(f'Scores: {len(scores)} matches')
+          "
+
+      - name: 赛后复盘
+        run: |
+          cd scraper
+          python generate_review.py --today || echo "No matches to review today"
+
+      - name: 更新经验库
+        run: |
+          cd scraper
+          python -c "
+          import json
+          from pathlib import Path
+          from datetime import datetime, timezone, timedelta
+          CST = timezone(timedelta(hours=8))
+          rdir = Path('../match_data/reviews')
+          if not rdir.exists():
+              print('No review data')
+              exit(0)
+          insights = []
+          for f in sorted(rdir.glob('daily_review_*.json')):
+              d = json.loads(f.read_text(encoding='utf-8'))
+              for ins in d.get('new_insights',[]):
+                  if ins:
+                      insights.append({'date': d.get('date',''), 'insight': ins})
+          ep = Path('../data/experience_library.json')
+          ep.parent.mkdir(parents=True, exist_ok=True)
+          lib = {}
+          if ep.exists():
+              lib = json.loads(ep.read_text(encoding='utf-8'))
+          lib['total_insights'] = len(insights)
+          lib['insights'] = insights[-100:]
+          lib['updated_at'] = datetime.now(CST).isoformat()
+          ep.write_text(json.dumps(lib, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(f'Experience library: {len(insights)} insights')
+          "
+
+      - name: 提交结果
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add match_data/ data/ 2>/dev/null || true
+          git commit -m "Post-match review $(date -u -d '+8 hours' '+%Y-%m-%d %H:%M') CST" || echo "No changes"
+          git push

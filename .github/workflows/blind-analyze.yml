@@ -1,0 +1,128 @@
+name: 赛前盲测分析
+
+on:
+  schedule:
+    # 北京时间 03:00 = UTC 19:00 (赛前3小时)
+    - cron: '0 19 * * *'
+    # 北京时间 03:45 = UTC 19:45 (赛前15分钟)
+    - cron: '45 19 * * *'
+  workflow_dispatch:
+    inputs:
+      match_ids:
+        description: '比赛ID列表(空格分隔)，留空则自动获取今日比赛'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests beautifulsoup4 openpyxl
+
+      - name: 更新赛季数据
+        run: |
+          cd scraper
+          python chuqi_pipeline.py --season
+
+      - name: 获取今日比赛ID
+        id: get-matches
+        run: |
+          cd scraper
+          python -c "
+          import json
+          from datetime import datetime, timezone, timedelta
+          CST = timezone(timedelta(hours=8))
+          with open('../match_data/season_data.json','r',encoding='utf-8') as f:
+              season = json.load(f)
+          today = datetime.now(CST).strftime('%Y-%m-%d')
+          ids = [str(e['id']) for e in season.get('events',[]) if today in str(e.get('scheduletime',''))]
+          if not ids:
+              ids = [str(e['id']) for e in season.get('events',[])][-5:]
+          print(','.join(ids))
+          " > /tmp/match_ids.txt
+          cat /tmp/match_ids.txt
+
+      - name: 抓取比赛完整数据
+        run: |
+          cd scraper
+          MATCH_IDS="${{ github.event.inputs.match_ids }}"
+          if [ -z "$MATCH_IDS" ]; then
+            MATCH_IDS=$(cat /tmp/match_ids.txt | tr ',' ' ')
+          fi
+          echo "Match IDs: $MATCH_IDS"
+          for mid in $MATCH_IDS; do
+            python chuqi_pipeline.py "$mid"
+          done
+
+      - name: 盲测分析+预测
+        run: |
+          cd scraper
+          MATCH_IDS="${{ github.event.inputs.match_ids }}"
+          if [ -z "$MATCH_IDS" ]; then
+            MATCH_IDS=$(cat /tmp/match_ids.txt | tr ',' ' ')
+          fi
+          for mid in $MATCH_IDS; do
+            echo "=== Blind Analysis: $mid ==="
+            python blind_read.py "$mid"
+            python -c "
+            import sys, json
+            sys.path.insert(0, '.')
+            from blind_read import blind_read
+            from analyze_signals import analyze, prediction_to_dict, print_prediction
+            from pathlib import Path
+            report = blind_read('$mid', Path('../match_data'))
+            pred = analyze(report)
+            print_prediction(pred)
+            d = prediction_to_dict(pred)
+            out = Path('../match_data/$mid/prediction.json')
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+            "
+          done
+
+      - name: 生成分析报告
+        run: |
+          cd scraper
+          python -c "
+          import json
+          from pathlib import Path
+          from datetime import datetime, timezone, timedelta
+          CST = timezone(timedelta(hours=8))
+          match_dir = Path('../match_data')
+          reports = []
+          for d in sorted(match_dir.iterdir()):
+              pf = d / 'prediction.json'
+              if d.is_dir() and pf.exists():
+                  reports.append(json.loads(pf.read_text(encoding='utf-8')))
+          report = {
+              'date': datetime.now(CST).strftime('%Y-%m-%d'),
+              'total_matches': len(reports),
+              'predictions': reports,
+              'generated_at': datetime.now(CST).isoformat(),
+          }
+          out = Path('../data/analysis_' + datetime.now(CST).strftime('%Y-%m-%d_%H%M') + '.json')
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(f'Report: {out}')
+          "
+
+      - name: 提交结果
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add match_data/ data/ 2>/dev/null || true
+          git commit -m "Blind analysis $(date -u -d '+8 hours' '+%Y-%m-%d %H:%M') CST" || echo "No changes"
+          git push

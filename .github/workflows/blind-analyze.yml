@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       match_ids:
-        description: '比赛ID列表(空格分隔)，留空则自动获取今日比赛'
+        description: '比赛ID列表(逗号分隔)，留空则自动获取今日比赛'
         required: false
         default: ''
 
@@ -37,33 +37,17 @@ jobs:
           cd scraper
           python chuqi_pipeline.py --season
 
-      - name: 获取今日比赛ID
-        id: get-matches
-        run: |
-          cd scraper
-          python -c "
-          import json
-          from datetime import datetime, timezone, timedelta
-          CST = timezone(timedelta(hours=8))
-          with open('../match_data/season_data.json','r',encoding='utf-8') as f:
-              season = json.load(f)
-          today = datetime.now(CST).strftime('%Y-%m-%d')
-          ids = [str(e['id']) for e in season.get('events',[]) if today in str(e.get('scheduletime',''))]
-          if not ids:
-              ids = [str(e['id']) for e in season.get('events',[])][-5:]
-          print(','.join(ids))
-          " > /tmp/match_ids.txt
-          cat /tmp/match_ids.txt
-
-      - name: 抓取比赛完整数据
+      - name: 抓取今日比赛完整数据
         run: |
           cd scraper
           MATCH_IDS="${{ github.event.inputs.match_ids }}"
           if [ -z "$MATCH_IDS" ]; then
-            MATCH_IDS=$(cat /tmp/match_ids.txt | tr ',' ' ')
+            # 从赛季数据获取今日比赛
+            python -c "import json; from datetime import datetime, timezone, timedelta; CST=timezone(timedelta(hours=8)); s=json.load(open('../match_data/season_data.json')); today=datetime.now(CST).strftime('%Y-%m-%d'); ids=[str(e['id']) for e in s.get('events',[]) if today in str(e.get('scheduletime',''))] or [str(e['id']) for e in s.get('events',[])][-5:]; print(','.join(ids))" > /tmp/ids.txt
+            MATCH_IDS=$(cat /tmp/ids.txt)
           fi
           echo "Match IDs: $MATCH_IDS"
-          for mid in $MATCH_IDS; do
+          for mid in $(echo $MATCH_IDS | tr ',' ' '); do
             python chuqi_pipeline.py "$mid"
           done
 
@@ -71,53 +55,10 @@ jobs:
         run: |
           cd scraper
           MATCH_IDS="${{ github.event.inputs.match_ids }}"
-          if [ -z "$MATCH_IDS" ]; then
-            MATCH_IDS=$(cat /tmp/match_ids.txt | tr ',' ' ')
+          if [ -z "$MATCH_IDS" ] && [ -f /tmp/ids.txt ]; then
+            MATCH_IDS=$(cat /tmp/ids.txt)
           fi
-          for mid in $MATCH_IDS; do
-            echo "=== Blind Analysis: $mid ==="
-            python blind_read.py "$mid"
-            python -c "
-            import sys, json
-            sys.path.insert(0, '.')
-            from blind_read import blind_read
-            from analyze_signals import analyze, prediction_to_dict, print_prediction
-            from pathlib import Path
-            report = blind_read('$mid', Path('../match_data'))
-            pred = analyze(report)
-            print_prediction(pred)
-            d = prediction_to_dict(pred)
-            out = Path('../match_data/$mid/prediction.json')
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
-            "
-          done
-
-      - name: 生成分析报告
-        run: |
-          cd scraper
-          python -c "
-          import json
-          from pathlib import Path
-          from datetime import datetime, timezone, timedelta
-          CST = timezone(timedelta(hours=8))
-          match_dir = Path('../match_data')
-          reports = []
-          for d in sorted(match_dir.iterdir()):
-              pf = d / 'prediction.json'
-              if d.is_dir() and pf.exists():
-                  reports.append(json.loads(pf.read_text(encoding='utf-8')))
-          report = {
-              'date': datetime.now(CST).strftime('%Y-%m-%d'),
-              'total_matches': len(reports),
-              'predictions': reports,
-              'generated_at': datetime.now(CST).isoformat(),
-          }
-          out = Path('../data/analysis_' + datetime.now(CST).strftime('%Y-%m-%d_%H%M') + '.json')
-          out.parent.mkdir(parents=True, exist_ok=True)
-          out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
-          print(f'Report: {out}')
-          "
+          python run_blind_pipeline.py "$MATCH_IDS"
 
       - name: 提交结果
         run: |
